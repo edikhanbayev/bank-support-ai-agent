@@ -1,0 +1,9 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+bank_support.db
+bank_support_eval.db
+.idea/
+.vscode/
