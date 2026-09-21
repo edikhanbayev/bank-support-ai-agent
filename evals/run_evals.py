@@ -1,7 +1,6 @@
 import argparse
 import hashlib
 import json
-import os
 import platform
 import subprocess
 import sys
@@ -15,6 +14,7 @@ from uuid import uuid4
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent import build_agent, run_agent
+from app.config import MODEL_NAME
 from app.message_utils import extract_text, extract_tool_calls
 
 @dataclass
@@ -168,7 +168,6 @@ def required_text_present(
         in normalized_answer
         for text in required_text_any
     )
-
 CASES = [
 EvalCase(
         name="customer_profile",
@@ -746,12 +745,30 @@ def _git_commit() -> str | None:
         return None
 
 
+def _git_is_clean() -> bool | None:
+    """Return True when the Git working tree has no uncommitted changes."""
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout.strip() == ""
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def _package_versions() -> dict[str, str | None]:
     packages = [
         "langchain",
         "langgraph",
         "langchain-openai",
+        "langgraph-checkpoint-postgres",
+        "openai",
         "SQLAlchemy",
+        "fastapi",
+        "pydantic",
     ]
     versions = {}
 
@@ -847,10 +864,12 @@ def save_results(
             "run_id": run_id,
             "label": label,
             "git_commit": _git_commit(),
+            "git_worktree_clean": _git_is_clean(),
             "python_version": platform.python_version(),
-            "model_name": os.getenv("MODEL_NAME"),
+            "model_name": MODEL_NAME,
             "packages": _package_versions(),
             "case_manifest_sha256": _case_manifest_hash(),
+            "case_count": len(CASES),
             "hitl_enabled": False,
         },
         "summary": {
@@ -881,6 +900,14 @@ def save_results(
 
 def run(output_directory: Path, label: str) -> int:
     results = []
+
+    git_clean = _git_is_clean()
+    if git_clean is False:
+        print(
+            "WARNING: Git working tree is not clean. "
+            "Commit changes before producing final evaluation evidence."
+        )
+
     checkpointer = InMemorySaver()
 
     # Core evals intentionally disable HITL so they continue to measure
@@ -958,3 +985,4 @@ if __name__ == "__main__":
             label=args.label,
         )
     )
+
