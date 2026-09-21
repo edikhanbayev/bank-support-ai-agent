@@ -36,7 +36,7 @@ jobs:
           pip install -r requirements.lock.txt
 
       - name: Run deterministic tests
-        run: pytest -q
+        run: python -m pytest -q
 
   database-smoke:
     name: PostgreSQL migration smoke test
