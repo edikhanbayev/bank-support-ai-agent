@@ -1,6 +1,11 @@
 from uuid import uuid4
 
-from app.agent import run_agent
+from langgraph.checkpoint.memory import InMemorySaver
+
+from app.agent import (
+    build_agent,
+    run_agent,
+)
 from app.message_utils import (
     extract_text,
     extract_tool_calls
@@ -19,6 +24,12 @@ def main():
     print(f"Thread: {thread_id}")
     print("Type 'exit' to stop.\n")
 
+    checkpointer = InMemorySaver()
+
+    agent = build_agent(
+        checkpointer
+    )
+
     while True:
 
         message = input(
@@ -29,6 +40,7 @@ def main():
             break
 
         result = run_agent(
+            agent=agent,
             message=message,
             customer_id=customer_id,
             thread_id=thread_id

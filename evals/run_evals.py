@@ -1,16 +1,21 @@
+import argparse
+import hashlib
 import json
+import os
+import platform
+import subprocess
+import sys
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from uuid import uuid4
 
-from app.agent import run_agent
-from app.message_utils import (
-    extract_text,
-    extract_tool_calls
-)
+from langgraph.checkpoint.memory import InMemorySaver
 
+from app.agent import build_agent, run_agent
+from app.message_utils import extract_text, extract_tool_calls
 
 @dataclass
 class ToolExpectation:
@@ -631,113 +636,78 @@ def evaluate_turn(
             required_text_ok
     }
 
-def run_case(
-    case: EvalCase
-) -> dict:
 
-    thread_id = (
-        f"eval-{case.name}-{uuid4()}"
-    )
+def _result_messages(result) -> list:
+    """Return messages from either v1 dict output or LangGraph v2 output."""
+    if isinstance(result, dict):
+        return result["messages"]
 
+    interrupts = getattr(result, "interrupts", None) or []
+    if interrupts:
+        raise RuntimeError(
+            "Unexpected HITL interrupt during core evaluation. "
+            "Build the evaluation agent with enable_hitl=False."
+        )
+
+    value = getattr(result, "value", None)
+    if not isinstance(value, dict) or "messages" not in value:
+        raise TypeError(
+            "Unsupported agent result shape. Expected a dict with 'messages' "
+            "or a v2 result with value['messages']."
+        )
+
+    return value["messages"]
+
+
+def run_case(agent, case: EvalCase) -> dict:
+    thread_id = f"eval-{case.name}-{uuid4()}"
     previous_message_count = 0
-
     turn_results = []
 
-    print(
-        "\n"
-        + "=" * 80
-    )
+    print("\n" + "=" * 80)
+    print(f"CASE: {case.name}")
+    print("=" * 80)
 
-    print(
-        f"CASE: {case.name}"
-    )
-
-    print(
-        "=" * 80
-    )
-
-    for turn_number, turn in enumerate(
-        case.turns,
-        start=1
-    ):
-
+    for turn_number, turn in enumerate(case.turns, start=1):
         result = run_agent(
+            agent=agent,
             message=turn.prompt,
             customer_id=case.customer_id,
-            thread_id=thread_id
+            thread_id=thread_id,
         )
 
-        messages = result["messages"]
+        messages = _result_messages(result)
+        new_messages = messages[previous_message_count:]
+        previous_message_count = len(messages)
 
-        new_messages = messages[
-            previous_message_count:
-        ]
+        tool_calls = extract_tool_calls(new_messages)
+        answer = extract_text(messages[-1])
+        evaluation = evaluate_turn(turn, tool_calls, answer)
 
-        previous_message_count = len(
-            messages
-        )
-
-        tool_calls = extract_tool_calls(
-            new_messages
-        )
-
-        answer = extract_text(
-            messages[-1]
-        )
-
-        evaluation = evaluate_turn(
-            turn,
-            tool_calls,
-            answer
-        )
-
+        print("Checks:")
         print(
-            "Checks:"
-        )
-
-        print(
-            f"  Required tool sequence: "
+            "  Required tool sequence: "
             f"{evaluation['required_tool_sequence']}"
         )
-
         print(
-            f"  Forbidden tools absent: "
+            "  Forbidden tools absent: "
             f"{evaluation['forbidden_tools']}"
         )
-
         print(
-            f"  Forbidden text absent: "
+            "  Forbidden text absent: "
             f"{evaluation['forbidden_text']}"
         )
-
         print(
-            f"  Required text present: "
+            "  Required text present: "
             f"{evaluation['required_text']}"
         )
-
-        print(
-            f"\nTURN {turn_number}"
-        )
-
-        print(
-            f"Prompt: {turn.prompt}"
-        )
-
-        print(
-            f"Tools: {tool_calls}"
-        )
-
-        print(
-            f"Answer: {answer}"
-        )
-
+        print(f"\nTURN {turn_number}")
+        print(f"Prompt: {turn.prompt}")
+        print(f"Tools: {tool_calls}")
+        print(f"Answer: {answer}")
         print(
             "Result:",
-            (
-                "PASS"
-                if evaluation["passed"]
-                else "FAIL"
-            )
+            "PASS" if evaluation["passed"] else "FAIL",
         )
 
         turn_results.append(
@@ -745,8 +715,7 @@ def run_case(
                 "prompt": turn.prompt,
                 "tool_calls": tool_calls,
                 "answer": answer,
-                "evaluation":
-                    evaluation
+                "evaluation": evaluation,
             }
         )
 
@@ -757,151 +726,235 @@ def run_case(
 
     return {
         "name": case.name,
-        "customer_id":
-            case.customer_id,
-        "passed":
-            case_passed,
-        "turns":
-            turn_results
+        "category": case.category,
+        "customer_id": case.customer_id,
+        "passed": case_passed,
+        "turns": turn_results,
     }
 
-def run():
 
-    results = []
+def _git_commit() -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _package_versions() -> dict[str, str | None]:
+    packages = [
+        "langchain",
+        "langgraph",
+        "langchain-openai",
+        "SQLAlchemy",
+    ]
+    versions = {}
+
+    for package in packages:
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = None
+
+    return versions
+
+
+def _case_manifest() -> list[dict]:
+    manifest = []
 
     for case in CASES:
-
-        try:
-            result = run_case(
-                case
-            )
-
-        except Exception as exc:
-
-            result = {
+        manifest.append(
+            {
                 "name": case.name,
-                "passed": False,
-                "error": str(exc),
-                "turns": []
+                "category": case.category,
+                "customer_id": case.customer_id,
+                "turns": [
+                    {
+                        "prompt": turn.prompt,
+                        "required_tools": [
+                            {
+                                "name": item.name,
+                                "args_subset": item.args_subset,
+                            }
+                            for item in turn.required_tools
+                        ],
+                        "forbidden_tools": turn.forbidden_tools,
+                        "forbidden_text": turn.forbidden_text,
+                        "required_text_any": turn.required_text_any,
+                    }
+                    for turn in case.turns
+                ],
             }
-
-            print(
-                f"\nERROR: {exc}"
-            )
-
-        results.append(
-            result
         )
 
-    passed = sum(
-        1
-        for result in results
-        if result["passed"]
-    )
+    return manifest
 
-    total = len(results)
 
-    score = (
-        passed / total
-        if total
-        else 0
-    )
+def _case_manifest_hash() -> str:
+    encoded = json.dumps(
+        _case_manifest(),
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
-    print(
-        "\n"
-        + "=" * 80
-    )
 
-    print(
-        "EVALUATION SUMMARY"
-    )
-
-    print(
-        "=" * 80
-    )
+def _category_summary(results: list[dict]) -> dict[str, dict]:
+    summary: dict[str, dict] = {}
 
     for result in results:
+        category = result["category"]
+        row = summary.setdefault(
+            category,
+            {"passed": 0, "total": 0, "score": 0.0},
+        )
+        row["total"] += 1
+        if result["passed"]:
+            row["passed"] += 1
 
-        status = (
-            "PASS"
-            if result["passed"]
-            else "FAIL"
+    for row in summary.values():
+        row["score"] = (
+            row["passed"] / row["total"]
+            if row["total"]
+            else 0.0
         )
 
-        print(
-            f"{status:4} | "
-            f"{result['name']}"
-        )
+    return summary
 
-    print(
-        "-" * 80
-    )
-
-    print(
-        f"Passed: {passed}/{total}"
-    )
-
-    print(
-        f"Score: {score:.1%}"
-    )
-
-    save_results(
-        results,
-        passed,
-        total,
-        score
-    )
 
 def save_results(
-    results,
-    passed,
-    total,
-    score
-):
+    results: list[dict],
+    passed: int,
+    total: int,
+    score: float,
+    output_directory: Path,
+    label: str,
+) -> Path:
+    output_directory.mkdir(parents=True, exist_ok=True)
 
-    output_directory = Path(
-        "evals/results"
-    )
-
-    output_directory.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    timestamp = datetime.now(timezone.utc)
+    timestamp_id = timestamp.strftime("%Y%m%dT%H%M%SZ")
+    run_id = f"{timestamp_id}-{uuid4().hex[:8]}"
 
     output = {
-        "timestamp":
-            datetime.now().isoformat(),
-        "passed":
-            passed,
-        "total":
-            total,
-        "score":
-            score,
-        "cases":
-            results
+        "metadata": {
+            "timestamp_utc": timestamp.isoformat(),
+            "run_id": run_id,
+            "label": label,
+            "git_commit": _git_commit(),
+            "python_version": platform.python_version(),
+            "model_name": os.getenv("MODEL_NAME"),
+            "packages": _package_versions(),
+            "case_manifest_sha256": _case_manifest_hash(),
+            "hitl_enabled": False,
+        },
+        "summary": {
+            "passed": passed,
+            "total": total,
+            "score": score,
+            "categories": _category_summary(results),
+        },
+        "cases": results,
     }
 
-    output_path = (
-        output_directory
-        / "latest.json"
+    run_path = output_directory / f"run_{run_id}.json"
+    latest_path = output_directory / "latest.json"
+
+    for path in (run_path, latest_path):
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(
+                output,
+                file,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+    print(f"\nImmutable result saved to: {run_path}")
+    print(f"Latest result updated at: {latest_path}")
+    return run_path
+
+
+def run(output_directory: Path, label: str) -> int:
+    results = []
+    checkpointer = InMemorySaver()
+
+    # Core evals intentionally disable HITL so they continue to measure
+    # tool selection, authorization, grounding and state behavior directly.
+    # HITL behavior belongs in deterministic API tests.
+    agent = build_agent(
+        checkpointer=checkpointer,
+        enable_hitl=False,
     )
 
-    with output_path.open(
-        "w",
-        encoding="utf-8"
-    ) as file:
+    for case in CASES:
+        try:
+            result = run_case(agent, case)
+        except Exception as exc:
+            result = {
+                "name": case.name,
+                "category": case.category,
+                "customer_id": case.customer_id,
+                "passed": False,
+                "error": str(exc),
+                "turns": [],
+            }
+            print(f"\nERROR: {exc}")
 
-        json.dump(
-            output,
-            file,
-            indent=2,
-            ensure_ascii=False
-        )
+        results.append(result)
 
-    print(
-        f"\nResults saved to: "
-        f"{output_path}"
+    passed = sum(1 for result in results if result["passed"])
+    total = len(results)
+    score = passed / total if total else 0.0
+
+    print("\n" + "=" * 80)
+    print("EVALUATION SUMMARY")
+    print("=" * 80)
+
+    for result in results:
+        status = "PASS" if result["passed"] else "FAIL"
+        print(f"{status:4} | {result['name']}")
+
+    print("-" * 80)
+    print(f"Passed: {passed}/{total}")
+    print(f"Score: {score:.1%}")
+
+    save_results(
+        results=results,
+        passed=passed,
+        total=total,
+        score=score,
+        output_directory=output_directory,
+        label=label,
     )
+
+    return 0 if passed == total else 1
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--output-dir",
+        default="evals/results/runs",
+        help="Directory for immutable JSON evaluation results.",
+    )
+    parser.add_argument(
+        "--label",
+        default="manual",
+        help="Human-readable label stored with the run metadata.",
+    )
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    run()
+    args = parse_args()
+    sys.exit(
+        run(
+            output_directory=Path(args.output_dir),
+            label=args.label,
+        )
+    )

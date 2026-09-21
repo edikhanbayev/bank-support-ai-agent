@@ -8,7 +8,7 @@ from app.models import Customer, Transaction
 
 
 def seed_database():
-    Base.metadata.create_all(bind=engine)
+
 
     with SessionLocal() as session:
 

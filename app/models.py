@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text
@@ -106,4 +106,28 @@ class SupportTicket(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False
+    )
+
+class ConversationThread(Base):
+    __tablename__ = (
+        "conversation_threads"
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(100),
+        primary_key=True
+    )
+
+    customer_id: Mapped[str] = mapped_column(
+        ForeignKey("customers.id"),
+        nullable=False,
+        index=True,
+    )
+
+    created_at: Mapped[datetime] = (
+        mapped_column(
+            DateTime(timezone=True),
+            nullable=False,
+            default=lambda:datetime.now(timezone.utc),
+        )
     )

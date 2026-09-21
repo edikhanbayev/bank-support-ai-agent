@@ -1,0 +1,51 @@
+services:
+
+  db:
+    image: postgres:18
+
+    environment:
+      POSTGRES_USER: bank
+      POSTGRES_PASSWORD: bank
+      POSTGRES_DB: bank_support
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - bank_support_pgdata:/var/lib/postgresql
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U bank -d bank_support"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+
+  api:
+    build: .
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      DATABASE_URL: "postgresql+psycopg://bank:bank@db:5432/bank_support"
+
+      CHECKPOINT_DB_URI: "postgresql://bank:bank@db:5432/bank_support"
+
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+
+      MODEL_NAME: "${MODEL_NAME}"
+
+      LANGGRAPH_STRICT_MSGPACK: "true"
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+
+volumes:
+  bank_support_pgdata:

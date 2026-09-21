@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 from sqlalchemy import select
 from app.db import SessionLocal
-from app.models import Customer, SupportTicket, Transaction
+from app.models import Customer, SupportTicket, Transaction, ConversationThread
 
 
 def find_customer( customer_id: str) -> Customer | None:
@@ -57,3 +57,47 @@ def create_ticket( customer_id: str, transaction_id: str | None, category: str, 
         session.refresh(ticket)
 
         return ticket
+
+def ensure_thread_access(
+    thread_id: str,
+    customer_id: str,
+) -> None:
+    """
+    Ensure a conversation thread belongs to
+    the authenticated customer.
+
+    If the thread does not exist, ownership
+    is created for the current customer.
+
+    If it belongs to another customer,
+    access is rejected.
+    """
+
+    with SessionLocal() as session:
+
+        thread = session.get(
+            ConversationThread,
+            thread_id,
+        )
+
+        if thread is None:
+
+            session.add(
+                ConversationThread(
+                    id=thread_id,
+                    customer_id=customer_id,
+                )
+            )
+
+            session.commit()
+
+            return
+
+        if (
+            thread.customer_id
+            != customer_id
+        ):
+            raise PermissionError(
+                "Thread does not belong to "
+                "authenticated customer."
+            )

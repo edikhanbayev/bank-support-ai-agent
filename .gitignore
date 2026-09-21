@@ -7,3 +7,5 @@ bank_support.db
 bank_support_eval.db
 .idea/
 .vscode/
+migration_backup/
+migrations/
